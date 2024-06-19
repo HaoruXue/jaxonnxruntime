@@ -17,8 +17,10 @@ from collections.abc import Callable, Sequence
 import functools
 from typing import Any
 import jax
+import jax.numpy as jnp
 from jaxonnxruntime.core import handler
 from jaxonnxruntime.core import onnx_node
+from jaxonnxruntime.onnx_ops import onnx_ops_utils
 
 
 @handler.register_op('Slice')
@@ -26,50 +28,17 @@ class Slice(handler.Handler):
   """Implementation of the ONNX Slice operator."""
 
   @classmethod
-  def _prepare_1(
+  def _prepare(
       cls, node: onnx_node.OnnxNode, inputs: Sequence[Any], onnx_jax_impl: Any
   ):
-    starts = node.attrs.get('starts')
-    node.attrs_dict['starts'] = starts
-    node.attrs_dict['ends'] = node.attrs.get('ends')
-    node.attrs_dict['axes'] = node.attrs.get(
-        'axes', tuple(i for i in range(len(starts)))
-    )
-    node.attrs_dict['steps'] = None
-
-  @classmethod
-  def _prepare_10(
-      cls, node: onnx_node.OnnxNode, inputs: Sequence[Any], onnx_jax_impl: Any
-  ):
-    node.attrs_dict['starts'] = tuple(inputs[1].tolist())
-    node.attrs_dict['ends'] = tuple(inputs[2].tolist())
-    if len(inputs) >= 4:
-      node.attrs_dict['axes'] = tuple(inputs[3].tolist())
-    else:
-      node.attrs_dict['axes'] = None
-    if len(inputs) >= 5:
-      node.attrs_dict['steps'] = tuple(inputs[4].tolist())
-    else:
-      node.attrs_dict['steps'] = None
-
-  @classmethod
-  def _prepare_11(
-      cls, node: onnx_node.OnnxNode, inputs: Sequence[Any], onnx_jax_impl: Any
-  ):
-    cls._prepare_10(node, inputs, onnx_jax_impl)
-
-  @classmethod
-  def _prepare_13(
-      cls, node: onnx_node.OnnxNode, inputs: Sequence[Any], onnx_jax_impl: Any
-  ):
-    cls._prepare_10(node, inputs, onnx_jax_impl)
+    onnx_ops_utils.update_node_attrs_dict(node, onnx_jax_impl)
 
   @classmethod
   def version_1(
       cls, node: onnx_node.OnnxNode, inputs: Sequence[Any]
   ) -> Callable[..., Any]:
     """ONNX version_1 Slice op."""
-    cls._prepare_1(node, inputs, onnx_slice)
+    cls._prepare(node, inputs, onnx_slice)
     return onnx_slice
 
   @classmethod
@@ -77,7 +46,7 @@ class Slice(handler.Handler):
       cls, node: onnx_node.OnnxNode, inputs: Sequence[Any]
   ) -> Callable[..., Any]:
     """ONNX version_10 Slice op."""
-    cls._prepare_10(node, inputs, onnx_slice)
+    cls._prepare(node, inputs, onnx_slice)
     return onnx_slice
 
   @classmethod
@@ -85,7 +54,7 @@ class Slice(handler.Handler):
       cls, node: onnx_node.OnnxNode, inputs: Sequence[Any]
   ) -> Callable[..., Any]:
     """ONNX version_11 Slice op."""
-    cls._prepare_11(node, inputs, onnx_slice)
+    cls._prepare(node, inputs, onnx_slice)
     return onnx_slice
 
   @classmethod
@@ -93,22 +62,33 @@ class Slice(handler.Handler):
       cls, node: onnx_node.OnnxNode, inputs: Sequence[Any]
   ) -> Callable[..., Any]:
     """ONNX version_13 Slice op."""
-    cls._prepare_13(node, inputs, onnx_slice)
+    cls._prepare(node, inputs, onnx_slice)
     return onnx_slice
 
 
-@functools.partial(jax.jit, static_argnames=('starts', 'ends', 'axes', 'steps'))
-def onnx_slice(*input_args, starts, ends, axes, steps):
+@functools.partial(jax.jit, static_argnames=())
+def onnx_slice(*input_args):
   """The impl for https://github.com/onnx/onnx/blob/v1.12.0/docs/Operators.md#Slice."""
-  x = input_args[0]
-  if axes is None:
-    axes = tuple(range(len(starts)))
-  if steps is None:
-    steps = [1] * len(starts)
-  slices = tuple(
-      slice(start, end, step) for start, end, step in zip(starts, ends, steps)
-  )
-  sub_indx = [slice(None)] * len(x.shape)
-  for i, axis in enumerate(axes):
-    sub_indx[axis] = slices[i]
-  return x[tuple(sub_indx)]
+  x, starts, ends = input_args[:3]
+  assert len(starts) == len(ends)
+
+  if len(input_args) < 3:
+    axes = None
+    assert len(starts) == len(x.shape)
+    lax_start = starts
+    lax_end = ends
+  else:
+    axes = input_args[3]
+    lax_start = jnp.zeros(len(x.shape), dtype=jnp.int32)
+    lax_end = jnp.array(x.shape, dtype=jnp.int32)
+    lax_start = lax_start.at[axes].set(starts)
+    lax_end = lax_end.at[axes].set(ends)
+
+  if len(input_args) > 4:
+    steps = input_args[4]
+    lax_steps = jnp.ones(len(x.shape), dtype=jnp.int32)
+    lax_steps = lax_steps.at[axes].set(steps)
+  else:
+    steps = None
+
+  return jax.lax.slice(x, lax_start, lax_end, lax_steps)
